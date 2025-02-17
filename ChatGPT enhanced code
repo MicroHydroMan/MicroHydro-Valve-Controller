@@ -1,0 +1,244 @@
+This is the CHATGPT produced code from the original working code uploaded previously.
+
+// ARDUINO ROTORK VALVE OPERATOR CONTROL BOARD REPLACEMENT, SOURCE CODE
+// VERSION 8.1 CGPT Honders 2017, 2019, 12/2022
+// *******************SET*UP***********************
+int SetpointRPM = 1220;  // ~1820 one magnet 4 Pole, or ~1220, 2 magnets 6 Pole
+int Magnets = 1;         // Number of magnets on shaft, pulses per revolution
+int Span = 10;           // Sets max + and - Error from SetpointRPM, sets accuracy
+int WindDownTime = 30;   // Time for motor to stop before next pulse, ms
+int RunTime = 15;        // Motor run time to move valve, automatically adjusted
+// ******************END*SET*UP*********************
+
+// Pin Definitions
+int openPin = 8;   // Pin to set HIGH to run valve motor to OPEN
+int closePin = 7;  // Pin to set HIGH to run valve motor to CLOSE
+int RemCTRLPin = 4;  // Remote control input pin
+int RemOPin = 5;     // Remote OPEN valve pin
+int RemCPin = 6;     // Remote CLOSE valve pin
+
+// Variables for RPM calculation and motor control
+volatile boolean first, triggered;
+volatile unsigned long overflowCount, startTime, finishTime;
+int Error, ErrMag;    // Error signal (+ is fast), magnitude of Error
+float InvErrMag;      // Inverse of Error magnitude
+int RunMtr;           // Time in ms to run valve motor depending on RPM
+int RPM = 1220;       // Starting RPM for 6 pole generator
+int previousRPM = SetpointRPM;  // Stores last RPM reading
+unsigned long lastActionTime = 0;  // Tracks time for non-blocking delay
+
+// Interrupt Service Routine for RPM detection
+void isr() {
+    unsigned int counter = TCNT1;  // Save counter 1 count quickly
+    if (triggered) return;
+
+    if (first) {
+        startTime = (overflowCount << 16) + counter;
+        first = false;
+        return;
+    }
+
+    finishTime = (overflowCount << 16) + counter;
+    triggered = true;
+    detachInterrupt(0);
+}
+
+// Timer 1 Overflow Interrupt Service Routine
+ISR(TIMER1_OVF_vect) {
+    overflowCount++;
+}
+
+// Prepare for RPM interrupts
+void prepareForInterrupts() {
+    EIFR = _BV(INTF0);  // Clear flag for interrupt 0
+    first = true;
+    triggered = false;
+    attachInterrupt(0, isr, RISING);  // Set up to trigger on rising edge
+}
+
+// Setup function, runs once when Arduino starts
+void setup() {
+    Serial.begin(38400);  // Set up serial communication
+    Serial.println("Valve controller");
+    Serial.println("R.J. Honders 2025");
+    Serial.println("Version 8.1R CGPT");
+
+    // Initialize pin states
+    digitalWrite(RemCTRLPin, HIGH);  // Remote control, no external pullup R
+    digitalWrite(RemOPin, HIGH);     // Remote Open
+    digitalWrite(RemCPin, HIGH);     // Remote Close
+
+    pinMode(openPin, OUTPUT);        // Set openPin as OUTPUT
+    pinMode(closePin, OUTPUT);       // Set closePin as OUTPUT
+
+    // Timer 1 setup for RPM interrupts
+    TCCR1A = 0;
+    TCCR1B = 0;
+    TIMSK1 = _BV(TOIE1);   // Enable Timer1 Interrupt
+    TCNT1 = 0;             // Zero out Timer 1
+    TCCR1B = _BV(CS20);    // No prescaling
+
+    prepareForInterrupts();  // Set up for RPM interrupts
+}
+
+// Main loop
+void loop() {
+    boolean RemCTRL = digitalRead(RemCTRLPin);  // Remote control enabled if LOW
+    if (RemCTRL == LOW) {
+        handleRemoteControl();  // Run remote control logic
+        return;
+    }
+
+    // Wait for RPM interrupt
+    if (!triggered) return;//wait here until it is 
+
+    handleRPMCalculation();  // Perform RPM calculation and control valve
+}
+
+// Non-blocking delay function
+bool nonBlockingDelay(unsigned long delayTime) {
+    unsigned long currentTime = millis();
+    if (currentTime - lastActionTime >= delayTime) {
+        lastActionTime = currentTime;
+        return true;
+    }
+    return false;
+}
+
+// Remote control handling
+void handleRemoteControl() {
+    while (digitalRead(RemCTRLPin) == LOW) {
+        boolean Close = digitalRead(RemCPin);  // Check if remote CLOSE is triggered
+        boolean Open = digitalRead(RemOPin);   // Check if remote OPEN is triggered
+
+        if (Close == LOW) {
+            operateValve(closePin, "CLOSE");
+        } else if (Open == LOW) {
+            operateValve(openPin, "OPEN");
+        }
+    }
+}
+
+// Operate valve based on input command
+void operateValve(int valvePin, String action) {
+    Serial.println(action);  // Print action (OPEN/CLOSE)
+
+    digitalWrite(valvePin == openPin ? closePin : openPin, LOW);  // Disable other pin
+    digitalWrite(valvePin, HIGH);  // Activate specified pin
+
+    // Replace delay with non-blocking delay
+    if (nonBlockingDelay(10 * WindDownTime)) {
+        digitalWrite(valvePin, LOW);  // Reset pin to stop motor
+    }
+}
+
+// Handle RPM calculation and control valve movement
+void handleRPMCalculation() {
+    unsigned long elapsedTime = finishTime - startTime;  // Time between rising edges
+    int RPM = abs((60.0 * F_CPU / float(elapsedTime)) / Magnets);  // Calculate RPM
+   
+        Serial.println () ;
+        Serial.print ("  RPM=");
+        Serial.print (RPM);
+        Serial.print (" pRPM= "); 
+        Serial.print (previousRPM);
+        
+    if (RPM < 0 || RPM > 2 * SetpointRPM) RPM = SetpointRPM;  // Correct abnormal RPMs
+    int DeltaRPM = RPM - previousRPM;  // Calculate change in RPM
+
+        Serial.print ("  DeltaRPM= ");
+        Serial.print (DeltaRPM);
+      
+    if (abs(DeltaRPM) > 10 * Span) {   // Ignore large glitches
+        resetForNewRPM();
+        return;
+    }
+
+    previousRPM = RPM;  // Update previous RPM
+    Error = constrain(RPM - SetpointRPM, -200, 200);  // Calculate and constrain error
+    InvErrMag = abs((2 * Span) / Error);  // Calculate inverse error magnitude
+    ErrMag = constrain(abs(Error), 1, 3000);  // Constrain error magnitude
+
+    controlValveMovement(Error, DeltaRPM);  // Control valve based on RPM and error
+}
+
+// Reset and prepare for new RPM calculation
+void resetForNewRPM() {
+    Serial.println(" DeltaRPM >10*Span, RESET");
+    delay(100);  // Wait for system to settle
+    prepareForInterrupts();  // Prepare for new RPM calculation
+}
+
+// Control valve movement based on error and RPM delta
+void controlValveMovement(int Error, int DeltaRPM) {
+    if (Error > 2 * Span) {
+        closeValve(ErrMag, DeltaRPM);  // Close valve for large error
+    } else if (Error > Span && Error <= 2 * Span) {
+        closeValve(ErrMag, DeltaRPM);  // Close valve for moderate error
+    } else if (Error > Span / 2 && Error <= Span) {
+        closeValve(ErrMag, DeltaRPM);  // Close valve for small error
+    } else if (Error >= (Span / -2) && (Error <= Span / 2)) {
+        stopValve();  // Stop valve within dead band
+    } else if (Error < Span / -2 && Error >= -1 * Span) {
+        openValve(ErrMag, DeltaRPM);  // Open valve for small negative error
+    } else if (Error < (-1 * Span) && Error >= -2 * Span) {
+        openValve(ErrMag, DeltaRPM);  // Open valve for large negative error
+    } else {
+        openValve(ErrMag, DeltaRPM);  // Open valve for very large negative error
+    }
+}
+
+// Close valve for the calculated duration
+void closeValve(int ErrMag, int DeltaRPM) {
+    Serial.println("Closing Valve");
+    digitalWrite(openPin, LOW);  // Disable open valve
+    digitalWrite(closePin, HIGH);  // Enable close valve
+
+    RunMtr = abs((RunTime * ErrMag) + (WindDownTime * DeltaRPM));  // Calculate run time
+    if (nonBlockingDelay(RunMtr)) {
+        digitalWrite(closePin, LOW);  // Stop motor
+    }
+}
+
+// Open valve for the calculated duration
+void openValve(int ErrMag, int DeltaRPM) {
+  Serial.println(" Opening Valve");
+  digitalWrite(closePin, LOW); // Disable close valve
+  digitalWrite(openPin, HIGH); // Enable open valve
+
+  RunMtr = abs((RunTime * ErrMag) - (WindDownTime * DeltaRPM)); // Calculate run time
+  delay(RunMtr); // Run motor to open valve
+  digitalWrite(openPin, LOW); // Stop motor
+}
+
+// Stop valve and keep it at its current position
+void stopValve() {
+  Serial.println("Stopping Valve");
+  digitalWrite(closePin, LOW); // Ensure valve motor is stopped
+  digitalWrite(openPin, LOW);  // Ensure valve motor is stopped
+  delay((RunTime * 10) / abs(Error + 1)); // Hold valve position for time
+}
+
+
+This is the output as the generator shaft starts turning.
+NOTE that after the 3rd line starting with RPM= there is no further change in the continuing output, even with the generator shaft having stopped turning.
+
+R.J. Honders 2025
+Version 8.1R CGPT
+
+  RPM=577 pRPM= 1220  DeltaRPM= -643 DeltaRPM >10*Span, RESET
+
+  RPM=1149 pRPM= 1220  DeltaRPM= -71 Opening Valve
+
+  RPM=1149 pRPM= 1149  DeltaRPM= 0 Opening Valve
+
+  RPM=1149 pRPM= 1149  DeltaRPM= 0 Opening Valve
+
+  RPM=1149 pRPM= 1149  DeltaRPM= 0 Opening Valve
+
+  RPM=1149 pRPM= 1149  DeltaRPM= 0 Opening Valve
+
+  RPM=1149 pRPM= 1149  DeltaRPM= 0 Opening Valve
+
+  RPM=1149 pRPM= 1149  DeltaRPM= 0 Opening Valve
+
